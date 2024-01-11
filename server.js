@@ -1,43 +1,49 @@
 require('dotenv').config();
 const express = require('express');
 const app = express();
-const session = require('express-session');
-const generateSecretKey = require('./secretKey');
 const path = require('path');
 const db = require('./db');
 const bodyParser = require('body-parser');
 const User = require('./models/User');
 const AnalyticsModel = require('./models/Analytics');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken')
 
 app.set('view engine', 'ejs');
 
 app.set('views', path.join(__dirname, 'views'));
 
-app.use(session({
-  secret: generateSecretKey(),
-  resave: false,
-  saveUninitialized: true,
-  cookie: {
-    maxAge: 1000 * 60 * 60 * 24,
-    secure: false,
-    httpOnly: true
-  }
-}));
-
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-const authenticateUser = (req, res, next) => {
-  if (req.session.user) {
+const authenticateUser = async (req, res, next) => {
+  try {
+    const token = req.cookies.token || req.headers.authorization;
+
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+
+    const decodedToken = jwt.verify(token, process.env.JWT_SECRET_KEY);
+
+    const user = await User.findById(decodedToken.userId);
+
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+
+    req.user = user;
+
     next();
-  } else {
-    res.redirect('/login'); 
-  }
-};
+  } catch (error) {
+    console.log("JWT Error: ", error);
+    return res.status(401).json({ message: 'Invalid token' });
+  } 
+  };
 
 const checkAdmin = (req, res, next) => {
-  const user = req.session.user;
+  const user = req.user;
 
   if (user && user.role === 'admin') {
     next();
@@ -184,16 +190,27 @@ app.post('/signup', async (req, res) => {
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(409).json({ message: 'User already exists with this email.' });
+      return res.render('signup', { errorMessage: 'User already exists' });
     }
 
-    const newUser = new User({ username, email, password });
+    if (password !== confirmPassword) {
+      return res.render('signup', { errorMessage: 'Passwords do not match' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = new User({
+      username,
+      email,
+      password: hashedPassword,
+      role: 'user',
+    });
 
     await newUser.save();
 
-    res.redirect('/');
+    res.redirect('/login');
   } catch (error) {
-    res.status(500).json({ message: 'Error registering user', error: error.message });
+    res.render('signup', { errorMessage: 'An error occurred', error: error.message });
   }
 });
 
@@ -201,21 +218,31 @@ app.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // Check if the user exists
     const user = await User.findOne({ email });
-
-    if (!user || user.password !== password) {
-      return res.status(401).json({ message: 'Invalid email or password.' });
+    if (!user) {
+      return res.render('login', { errorMessage: 'User not found' });
     }
-    req.session.user = user;
-    res.render('index');
+
+    // Compare passwords
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.render('login', { errorMessage: 'Invalid password' });
+    }
+
+    // Generate JWT token
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET_KEY, { expiresIn: '5d' });
+
+    res.cookie('token', token);
+    res.redirect('/home'); 
   } catch (error) {
-    res.status(500).json({ message: 'Error logging in', error: error.message });
+    res.render('login', { errorMessage: 'An error occurred', error: error.message });
   }
 });
 
 app.post('/logout', (req, res) => {
 
-  req.session.destroy();
+  res.clearCookie();
 
   res.redirect('/login');
 });
